@@ -20,7 +20,7 @@ class KaplanMeierFitter(UnivariateFitter):
     """
 
     def fit(self, durations, event_observed=None, timeline=None, entry=None, label='KM_estimate',
-            alpha=None, left_censorship=False, ci_labels=None):
+            alpha=None, left_censorship=False, ci_labels=None, weights=None):
         """
         Parameters:
           duration: an array, or pd.Series, of length n -- duration subject was observed for
@@ -36,6 +36,7 @@ class KaplanMeierFitter(UnivariateFitter):
           left_censorship: True if durations and event_observed refer to left censorship events. Default False
           ci_labels: add custom column names to the generated confidence intervals
                 as a length-2 list: [<lower-bound name>, <upper-bound name>]. Default: <label>_lower_<alpha>
+          weights: an array of length n representing the weights for each observation
 
 
         Returns:
@@ -46,9 +47,54 @@ class KaplanMeierFitter(UnivariateFitter):
         estimate_name = 'survival_function_' if not left_censorship else 'cumulative_density_'
         v = _preprocess_inputs(durations, event_observed, timeline, entry)
         self.durations, self.event_observed, self.timeline, self.entry, self.event_table = v
+
         self._label = label
         alpha = alpha if alpha else self.alpha
-        log_survival_function, cumulative_sq_ = _additive_estimate(self.event_table, self.timeline,
+
+        if weights is not None:
+            df = pd.DataFrame(self.durations, columns=["event_at"])
+            df["removed"] = 1 if weights is None else weights 
+            df["variance"] = 1 if weights is None else weights
+            df["observed"] = np.asarray(event_observed)*weights
+            weight_table = df.groupby("event_at").agg({'removed': np.sum, 'observed': np.sum, 'variance':lambda x: (x**2).sum()})
+            
+            if self.entry is None:
+                births = pd.DataFrame( min(0, self.durations.min()) * np.ones(self.durations.shape[0]), columns=['event_at'])
+            else:
+                births = pd.DataFrame(self.entry, columns=['event_at'])
+            births["entrance"] = weights
+            births_table = births.groupby('event_at').sum()
+
+            weight_table = weight_table.join(births_table, how='outer', sort=True).fillna(0)
+            weight_table["at_risk"] = weight_table["entrance"].cumsum() - weight_table["removed"].cumsum().shift(1).fillna(0)
+            weight_table["variance"] = np.cumsum(weight_table["variance"][::-1])[::-1]
+            weight_table = weight_table.astype(float)
+
+            aumdeaths = weight_table['observed']
+            aumat_risk = weight_table['at_risk']
+            aumvar = weight_table["variance"]
+            deaths = self.event_table['observed']
+            at_risk = self.event_table['at_risk']
+
+            np.seterr(invalid='ignore')
+            est = (np.log(aumat_risk - aumdeaths) - np.log(aumat_risk))
+            estimate_ = np.cumsum(est)
+
+            np.seterr(divide='ignore')
+            proba = deaths / at_risk
+            varest = (1. * aumvar * proba * (1 - proba) / (aumat_risk - aumdeaths)**2).replace([np.inf], 0)
+            var_ = np.cumsum(varest)
+
+            timeline = sorted(self.timeline)
+            estimate_ = estimate_.reindex(timeline, method='pad').fillna(0)
+            var_ = var_.reindex(timeline, method='pad')
+            var_.index.name = 'timeline'
+            estimate_.index.name = 'timeline'
+            
+            log_survival_function = estimate_
+            cumulative_sq_ = var_
+        else:
+            log_survival_function, cumulative_sq_ = _additive_estimate(self.event_table, self.timeline,
                                                                    self._additive_f, self._additive_var,
                                                                    left_censorship)
 
@@ -94,6 +140,7 @@ class KaplanMeierFitter(UnivariateFitter):
 
     def _additive_f(self, population, deaths):
         np.seterr(invalid='ignore')
+        #return (np.log(population - deaths) - np.log(population))
         return (np.log(population - deaths) - np.log(population))
 
     def _additive_var(self, population, deaths):
