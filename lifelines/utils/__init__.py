@@ -184,20 +184,31 @@ def survival_table_from_events(death_times, event_observed, birth_times=None,
         if np.any(birth_times > death_times):
             raise ValueError('birth time must be less than time of death.')
 
+    if weights is None:
+        weights = 1
+
     # deal with deaths and censorships
     df = pd.DataFrame(death_times, columns=["event_at"])
-    df[removed] = 1 if weights is None else weights
+    df[removed] = 1
+    df["weighted_" + removed] = weights
+    df["variance"] = weights
     df[observed] = np.asarray(event_observed)
-    death_table = df.groupby("event_at").sum()
+    df["weighted_" + observed] = np.asarray(event_observed)*weights
+    death_table = df.groupby("event_at").agg({removed: np.sum, observed: np.sum, "weighted_"+removed: np.sum,
+        "weighted_"+observed: np.sum, 'variance':lambda x: (x**2).sum()})
     death_table[censored] = (death_table[removed] - death_table[observed]).astype(int)
+    death_table["weighted_"+censored] = (death_table["weighted_"+removed] - death_table["weighted_"+observed]).astype(int)
 
     # deal with late births
     births = pd.DataFrame(birth_times, columns=['event_at'])
     births[entrance] = 1
+    births["weighted_"+entrance] = weights
     births_table = births.groupby('event_at').sum()
 
     event_table = death_table.join(births_table, how='outer', sort=True).fillna(0)  # http://wesmckinney.com/blog/?p=414
     event_table[at_risk] = event_table[entrance].cumsum() - event_table[removed].cumsum().shift(1).fillna(0)
+    event_table["weighted_"+at_risk] = event_table["weighted_"+entrance].cumsum() - event_table["weighted_"+removed].cumsum().shift(1).fillna(0)
+    event_table["variance"] = np.cumsum(event_table["variance"][::-1])[::-1]
     return event_table.astype(float)
 
 
@@ -586,16 +597,23 @@ def _additive_estimate(events, timeline, _additive_f, _additive_var, reverse):
     if reverse:
         events = events.sort_index(ascending=False)
         at_risk = events['entrance'].sum() - events['removed'].cumsum().shift(1).fillna(0)
+        weighted_at_risk = events['weighted_entrance'].sum() - events['weighted_removed'].cumsum().shift(1).fillna(0)
 
         deaths = events['observed']
+        weighted_deaths = events['weighted_observed']
+        coef = events['variance']
 
-        estimate_ = np.cumsum(_additive_f(at_risk, deaths)).sort_index().shift(-1).fillna(0)
-        var_ = np.cumsum(_additive_var(at_risk, deaths)).sort_index().shift(-1).fillna(0)
+        estimate_ = np.cumsum(_additive_f(weighted_at_risk, weighted_deaths)).sort_index().shift(-1).fillna(0)
+        var_ = np.cumsum(_additive_var(at_risk, deaths, weighted_at_risk, weighted_deaths, coef)).sort_index().shift(-1).fillna(0)
     else:
         deaths = events['observed']
         at_risk = events['at_risk']
-        estimate_ = np.cumsum(_additive_f(at_risk, deaths))
-        var_ = np.cumsum(_additive_var(at_risk, deaths))
+        weighted_deaths = events['weighted_observed']
+        weighted_at_risk = events['weighted_at_risk']
+        coef = events['variance']
+
+        estimate_ = np.cumsum(_additive_f(weighted_at_risk, weighted_deaths))
+        var_ = np.cumsum(_additive_var(at_risk, deaths, weighted_at_risk, weighted_deaths, coef))
 
     timeline = sorted(timeline)
     estimate_ = estimate_.reindex(timeline, method='pad').fillna(0)
@@ -606,7 +624,7 @@ def _additive_estimate(events, timeline, _additive_f, _additive_var, reverse):
     return estimate_, var_
 
 
-def _preprocess_inputs(durations, event_observed, timeline, entry):
+def _preprocess_inputs(durations, event_observed, timeline, entry, weights = None):
     """
     Cleans and confirms input to what lifelines expects downstream
     """
@@ -623,7 +641,7 @@ def _preprocess_inputs(durations, event_observed, timeline, entry):
     if entry is not None:
         entry = np.asarray(entry).reshape((n,))
 
-    event_table = survival_table_from_events(durations, event_observed, entry)
+    event_table = survival_table_from_events(durations, event_observed, entry, weights=weights)
     if timeline is None:
         timeline = event_table.index.values
     else:
